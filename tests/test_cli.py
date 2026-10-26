@@ -4,7 +4,7 @@ from demucs_onnx_worker.cli import VERSION, build_parser, main
 
 
 def test_version_matches_package() -> None:
-    assert VERSION == "0.1.0"
+    assert VERSION == "0.1.1"
 
 
 def test_gui_argv_parses() -> None:

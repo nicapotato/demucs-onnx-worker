@@ -7,6 +7,8 @@ on this worker is accepted only so the GUI's flag set still parses.
 
 from __future__ import annotations
 
+import sys
+import typing as tp
 from pathlib import Path
 
 import numpy as np
@@ -31,21 +33,39 @@ def sources() -> tuple[str, ...]:
     return SOURCES
 
 
-def open_session(model_path: Path, providers: list[str]) -> tuple[ort.InferenceSession, str]:
-    """Open the graph. If the GPU provider fails to load, retry on CPU."""
+CPU_ONLY = ["CPUExecutionProvider"]
+
+
+def session_options(providers: list[str]) -> ort.SessionOptions:
     opts = ort.SessionOptions()
     opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+    if "DmlExecutionProvider" in providers:
+        # DirectML does not support memory-pattern planning or parallel execution.
+        # Left on, fused DML nodes fail at run time (DmlFusedNode_* non-zero status).
+        opts.enable_mem_pattern = False
+        opts.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+    return opts
+
+
+def is_cpu_only(session: ort.InferenceSession) -> bool:
+    return [p for p in session.get_providers() if p != "CPUExecutionProvider"] == []
+
+
+def open_session(model_path: Path, providers: list[str]) -> tuple[ort.InferenceSession, str]:
+    """Open the graph. If the GPU provider fails to load, retry on CPU."""
     try:
         session = ort.InferenceSession(
-            str(model_path), sess_options=opts, providers=list(providers)
+            str(model_path), sess_options=session_options(providers), providers=list(providers)
         )
-    except Exception:
-        if providers == ["CPUExecutionProvider"]:
+    except Exception as exc:
+        if providers == CPU_ONLY:
             raise
+        print(f"demucs_onnx_worker: {providers[0]} failed to load, using CPU: {exc}",
+              file=sys.stderr)
         session = ort.InferenceSession(
             str(model_path),
-            sess_options=opts,
-            providers=["CPUExecutionProvider"],
+            sess_options=session_options(CPU_ONLY),
+            providers=CPU_ONLY,
         )
     return session, device_name(list(session.get_providers()))
 
@@ -98,7 +118,13 @@ def separate_file(
     mp3: bool,
     bitrate_kbps: int,
     overlap: float = 0.25,
-) -> Path:
+    cpu_fallback: tp.Callable[[], ort.InferenceSession] | None = None,
+) -> ort.InferenceSession:
+    """Separate one track. Returns the session to reuse for the next track.
+
+    When the GPU session raises during ``run`` and ``cpu_fallback`` is given,
+    the track restarts on a CPU session, which is returned.
+    """
     stem_names = sources()
     dest = out_dir / track_name
     dest.mkdir(parents=True, exist_ok=True)
@@ -112,7 +138,19 @@ def separate_file(
         pct = round(100.0 * done / total, 2) if total else 0.0
         emit("separating", track=str(audio_path), done=done, total=total, pct=pct)
 
-    stems = separate_array(session, mix, overlap=overlap, on_chunk=on_chunk)
+    try:
+        stems = separate_array(session, mix, overlap=overlap, on_chunk=on_chunk)
+    except Exception as exc:
+        if cpu_fallback is None or is_cpu_only(session):
+            raise
+        gpu = device_name(list(session.get_providers()))
+        reason = str(exc).replace("\n", " ")
+        print(f"demucs_onnx_worker: {gpu} inference failed, retrying on CPU: {reason}",
+              file=sys.stderr)
+        session = cpu_fallback()
+        emit("status", stage="fallback_cpu", device="cpu", reason=reason[:300])
+        emit("separating", track=str(audio_path), done=0, total=n_chunks, pct=0.0)
+        stems = separate_array(session, mix, overlap=overlap, on_chunk=on_chunk)
     if native_sr != SAMPLE_RATE:
         stems = {
             name: resample_to_native(audio, SAMPLE_RATE, native_sr)
@@ -132,4 +170,4 @@ def separate_file(
         sources=list(stem_names),
         format=ext,
     )
-    return dest
+    return session

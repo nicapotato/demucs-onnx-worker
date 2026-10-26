@@ -5,15 +5,17 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
+import traceback
 from pathlib import Path
 
 from demucs_onnx.providers import resolve_providers
 
 from . import events
+from .device import gpu_name
 from .model_path import MODEL_NAME, executable_dir, find_model
 from .separate import separate_file, sources
 
-VERSION = "0.1.0"
+VERSION = "0.1.1"
 
 
 def _batch_size(value: str) -> int | str:
@@ -84,25 +86,27 @@ def _one_line(exc: BaseException) -> str:
 
 
 def _run(args: argparse.Namespace) -> int:
-    from .separate import open_session
+    from .separate import CPU_ONLY, open_session
 
     events.emit("status", stage="loading_model", model=MODEL_NAME)
     model_path = find_model(executable_dir(sys.argv[0] if sys.argv else None), args.weights)
     providers = resolve_providers(args.providers)
     session, device = open_session(model_path, providers)
-    events.emit(
-        "status",
-        stage="model_ready",
-        model=MODEL_NAME,
-        device=device,
-        sources=list(sources()),
-    )
+
+    def cpu_fallback():
+        return open_session(model_path, CPU_ONLY)[0]
+
+    ready = {"model": MODEL_NAME, "device": device, "sources": list(sources())}
+    gpu = gpu_name(device)
+    if gpu:
+        ready["gpu"] = gpu
+    events.emit("status", stage="model_ready", **ready)
     for track in args.tracks:
         path = Path(track)
         if not path.is_file():
             raise FileNotFoundError(f"input not found: {path}")
         name = args.track_name or path.stem
-        separate_file(
+        session = separate_file(
             session,
             path,
             Path(args.out),
@@ -110,6 +114,7 @@ def _run(args: argparse.Namespace) -> int:
             mp3=args.mp3,
             bitrate_kbps=args.mp3_bitrate,
             overlap=args.overlap,
+            cpu_fallback=cpu_fallback,
         )
     return 0
 
@@ -137,8 +142,9 @@ def main(argv: list[str] | None = None) -> int:
         return _run(args)
     except Exception as exc:
         events.emit("error", message=_one_line(exc))
-        if not events.enabled():
-            print(_one_line(exc), file=sys.stderr)
+        # stdout carries one-line JSON for the GUI; the full traceback goes to stderr.
+        traceback.print_exc(file=sys.stderr)
+        sys.stderr.flush()
         return 1
 
 

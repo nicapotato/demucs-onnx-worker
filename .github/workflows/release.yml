@@ -118,8 +118,10 @@ jobs:
           - id: mac-x64
             os: macos-15-intel
             zip: demucs-onnx-worker-mac-x64
+          # 22.04 (glibc 2.35): the frozen libpython links the runner's glibc, and
+          # rocknroller / demucs-ui-app Linux builds target 22.04 too.
           - id: linux-x64
-            os: ubuntu-latest
+            os: ubuntu-22.04
             zip: demucs-onnx-worker-linux-x64
           - id: windows-x64
             os: windows-latest
