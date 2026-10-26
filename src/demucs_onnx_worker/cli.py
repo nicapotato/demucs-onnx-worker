@@ -92,7 +92,7 @@ def _log(msg: str) -> None:
 def _run(args: argparse.Namespace) -> int:
     import onnxruntime as ort
 
-    from .separate import CPU_ONLY, is_cpu_only, open_session
+    from .separate import CPU_ONLY, is_cpu_only, open_mode, open_session
 
     events.emit("status", stage="loading_model", model=MODEL_NAME)
     model_path = find_model(executable_dir(sys.argv[0] if sys.argv else None), args.weights)
@@ -101,17 +101,16 @@ def _run(args: argparse.Namespace) -> int:
     uses_dml = "DmlExecutionProvider" in providers
     gpu = gpu_name("dml") if uses_dml else None
     key = dml_state.state_key(ort.__version__, gpu, model_path)
-    mode, why = "fused", "default"
+    cache_dir = dml_state.state_path().parent
+    mode, why = dml_state.DEFAULT, "default"
     if uses_dml:
         mode, why = dml_state.start_mode(key)
         if why != "default":
             _log(f"DirectML mode {mode} ({why}; {dml_state.state_path()}, "
                  f"set {dml_state.ENV}=retry to try the GPU again)")
-        if mode == "cpu":
-            providers = CPU_ONLY
-    session, device = open_session(model_path, providers, dml_fusion=mode != "unfused")
-    if uses_dml and is_cpu_only(session) and mode != "cpu":
-        mode = "cpu"
+        session, device, mode = open_mode(model_path, providers, mode, cache_dir)
+    else:
+        session, device = open_session(model_path, providers)
     state = {"mode": mode}
 
     def on_failure(failed: ort.InferenceSession, exc: Exception):
@@ -121,11 +120,10 @@ def _run(args: argparse.Namespace) -> int:
         was = device_name(list(failed.get_providers()))
         nxt = dml_state.next_mode(state["mode"]) if uses_dml else "cpu"
         _log(f"{was} ({state['mode']}) inference failed: {reason}")
-        if nxt == "unfused":
-            _log("retrying DirectML with graph fusion disabled")
-            replacement, dev = open_session(model_path, providers, dml_fusion=False)
-            nxt = "unfused" if not is_cpu_only(replacement) else "cpu"
-            events.emit("status", stage="retry_gpu" if nxt == "unfused" else "fallback_cpu",
+        if nxt != "cpu":
+            _log(f"retrying DirectML in mode {nxt} (graph fusion disabled)")
+            replacement, dev, nxt = open_mode(model_path, providers, nxt, cache_dir)
+            events.emit("status", stage="retry_gpu" if nxt != "cpu" else "fallback_cpu",
                         device=dev, mode=nxt, reason=reason[:1000])
         else:
             _log("retrying on CPU")

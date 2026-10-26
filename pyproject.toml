@@ -17,8 +17,13 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
+  "onnx>=1.17",
   "pytest>=8.0",
   "ruff>=0.5",
+]
+# Splits the graph so DirectML runs the network and CPU runs the iSTFT.
+dml = [
+  "onnx>=1.17",
 ]
 freeze = [
   "pyinstaller>=6.0",

@@ -31,6 +31,9 @@ if (-not (Get-Command uv -ErrorAction SilentlyContinue)) {
 & uv pip uninstall --python $Python onnxruntime
 & uv pip install --python $Python "onnxruntime-directml==1.24.4"
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+# The DirectML path splits the graph at load time (split_model.py).
+& uv pip install --python $Python "onnx>=1.17"
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 & $Python -c "import PyInstaller" 2>$null
 if ($LASTEXITCODE -ne 0) {
@@ -38,7 +41,7 @@ if ($LASTEXITCODE -ne 0) {
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 }
 
-& $Python -c "import onnxruntime, demucs_onnx, lameenc, soundfile, soxr; print('onnxruntime', onnxruntime.__version__, onnxruntime.get_available_providers())"
+& $Python -c "import onnx, onnxruntime, demucs_onnx, lameenc, soundfile, soxr; print('onnxruntime', onnxruntime.__version__, onnxruntime.get_available_providers())"
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 $Onedir = Join-Path $Dist "demucs_onnx_worker"
@@ -55,6 +58,7 @@ $Entry = Join-Path $Root "src\demucs_onnx_worker\__main__.py"
     --paths (Join-Path $Root "src") `
     --collect-submodules demucs_onnx_worker `
     --collect-all onnxruntime `
+    --collect-all onnx `
     --collect-all soundfile `
     --collect-all soxr `
     --collect-all lameenc `

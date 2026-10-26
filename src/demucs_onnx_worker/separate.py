@@ -82,6 +82,36 @@ def open_session(
     return session, device_name(list(session.get_providers()))
 
 
+def open_mode(
+    model_path: Path, providers: list[str], mode: str, cache_dir: Path
+) -> tuple[tp.Any, str, str]:
+    """Open the session for a DirectML ladder mode (see dml_state).
+
+    Returns ``(session, device, mode)``; ``mode`` changes when a split cannot be
+    built (no ``onnx`` package, unexpected graph) or the GPU fails to load.
+    """
+    if mode == "cpu" or providers == CPU_ONLY:
+        return (*open_session(model_path, CPU_ONLY), "cpu")
+    fusion = mode in ("split", "fused")
+    if mode.startswith("split"):
+        try:
+            from .split_model import SplitSession, ensure_split
+
+            head_path, tail_path = ensure_split(model_path, cache_dir)
+        except Exception as exc:
+            print(f"demucs_onnx_worker: cannot split the graph ({describe(exc)}); "
+                  "running it whole on the GPU", file=sys.stderr)
+            mode = "fused" if fusion else "unfused"
+        else:
+            head, device = open_session(head_path, providers, dml_fusion=fusion)
+            if is_cpu_only(head):
+                return (*open_session(model_path, CPU_ONLY), "cpu")
+            tail, _ = open_session(tail_path, CPU_ONLY)
+            return SplitSession(head, tail), device, mode
+    session, device = open_session(model_path, providers, dml_fusion=fusion)
+    return session, device, ("cpu" if is_cpu_only(session) else mode)
+
+
 def separate_array(
     session: ort.InferenceSession,
     mix: np.ndarray,

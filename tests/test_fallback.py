@@ -27,6 +27,9 @@ class FakeSession:
     def get_providers(self) -> list[str]:
         return self._providers
 
+    def get_outputs(self) -> list:
+        return []
+
     def run(self, _outputs, feeds):
         self.calls += 1
         if self._fail:
@@ -79,7 +82,7 @@ def test_failure_without_replacement_is_raised(tmp_path, fake_audio) -> None:
 
 @pytest.fixture
 def fake_cli(tmp_path, monkeypatch, fake_audio):
-    """cli._run with fake sessions: fused DML fails, unfused DML fails, CPU works."""
+    """cli._run with fake sessions: split DML fails, split unfused fails, CPU works."""
     model = tmp_path / "htdemucs_6s_fp16weights.onnx"
     model.write_bytes(b"x" * 10)
     wav = tmp_path / "song.wav"
@@ -91,14 +94,20 @@ def fake_cli(tmp_path, monkeypatch, fake_audio):
     monkeypatch.setattr(cli, "gpu_name", lambda d: GPU if d == "dml" else None)
     opened: list[str] = []
 
-    def fake_open(_path, providers, *, dml_fusion=True):
+    def fake_open(path, providers, *, dml_fusion=True):
+        prefix = "split_" if path.name.startswith(("head", "tail")) else ""
         if providers == separate.CPU_ONLY:
-            opened.append("cpu")
+            opened.append(prefix + "cpu")
             return FakeSession(separate.CPU_ONLY, fail=False, label="cpu"), "cpu"
-        label = "fused" if dml_fusion else "unfused"
+        label = prefix + ("fused" if dml_fusion else "unfused")
         opened.append(label)
         return FakeSession(DML, fail=True, label=label), "dml"
 
+    from demucs_onnx_worker import split_model
+
+    monkeypatch.setattr(
+        split_model, "ensure_split", lambda _m, d: (d / "head.onnx", d / "tail.onnx")
+    )
     monkeypatch.setattr(separate, "open_session", fake_open)
     argv = [str(wav), "-o", str(tmp_path / "out"), "--track-name", "song", "--progress-json"]
     return argv, opened
@@ -114,7 +123,7 @@ def test_dml_ladder_then_remembered(fake_cli, capsys) -> None:
         assert cli.main(argv) == 0
     finally:
         events.set_enabled(False)
-    assert opened == ["fused", "unfused", "cpu"]
+    assert opened == ["split_fused", "split_cpu", "split_unfused", "split_cpu", "cpu"]
     captured = capsys.readouterr()
     stages = [e.get("stage") for e in _events(captured.out) if e["event"] == "status"]
     assert stages == ["loading_model", "model_ready", "retry_gpu", "fallback_cpu"]
@@ -143,14 +152,47 @@ def test_retry_env_ignores_remembered(fake_cli, monkeypatch, capsys) -> None:
         assert cli.main(argv) == 0
     finally:
         events.set_enabled(False)
-    assert opened[0] == "fused"
+    assert opened[0] == "split_fused"
+
+
+def test_env_forces_whole_graph_mode(fake_cli, monkeypatch) -> None:
+    argv, opened = fake_cli
+    monkeypatch.setenv(dml_state.ENV, "fused")
+    try:
+        assert cli.main(argv) == 0
+    finally:
+        events.set_enabled(False)
+    assert opened == ["fused", "unfused", "cpu"]
+
+
+def test_split_failure_runs_whole_graph(fake_cli, monkeypatch) -> None:
+    argv, opened = fake_cli
+    from demucs_onnx_worker import split_model
+
+    def broken(_m, _d):
+        raise ImportError("No module named 'onnx'")
+
+    monkeypatch.setattr(split_model, "ensure_split", broken)
+    try:
+        assert cli.main(argv) == 0
+    finally:
+        events.set_enabled(False)
+    assert opened == ["fused", "unfused", "cpu"]
+
+
+def test_old_state_key_is_ignored(tmp_path) -> None:
+    model = tmp_path / "m.onnx"
+    model.write_bytes(b"x")
+    assert dml_state.state_key("1.24.4", GPU, model).startswith(f"v{dml_state.KEY_VERSION}|")
 
 
 def test_remembered_mode_expires(tmp_path) -> None:
     path = tmp_path / "s.json"
-    dml_state.remember("k", "unfused", "r", path=path)
-    assert dml_state.start_mode("k", path=path) == ("unfused", "remembered")
+    dml_state.remember("k", "split_unfused", "r", path=path)
+    assert dml_state.start_mode("k", path=path) == ("split_unfused", "remembered")
     later = json.loads(path.read_text())["k"]["at"] + dml_state.RETRY_AFTER_S + 1
-    assert dml_state.start_mode("k", path=path, now=later) == ("fused", "default")
+    assert dml_state.start_mode("k", path=path, now=later) == ("split", "default")
+    assert dml_state.next_mode("split") == "split_unfused"
+    assert dml_state.next_mode("split_unfused") == "cpu"
     assert dml_state.next_mode("fused") == "unfused"
     assert dml_state.next_mode("cpu") == "cpu"

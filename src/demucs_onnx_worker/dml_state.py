@@ -3,12 +3,17 @@
 The GUI starts one worker process per song, so without this every song would
 pay for a failed GPU attempt before falling back. The ladder is::
 
-    fused  ->  unfused (ep.dml.disable_graph_fusion)  ->  cpu
+    split  ->  split_unfused  ->  cpu
+
+``split`` runs the network on DirectML and the iSTFT tail on CPU (see
+split_model). ``*_unfused`` sets ep.dml.disable_graph_fusion. ``fused`` /
+``unfused`` run the whole graph on DirectML; they OOM in the iSTFT on 10 GB
+cards and are only reachable through ``DEMUCS_ONNX_DML``.
 
 A remembered step is keyed on ONNX Runtime version, adapter name, and model
 file, and expires after ``RETRY_AFTER_S`` so a driver update gets retried.
-``DEMUCS_ONNX_DML`` overrides it: ``fused``, ``unfused``, ``cpu``, or
-``retry`` (ignore what was remembered).
+``DEMUCS_ONNX_DML`` overrides it: any mode name, or ``retry`` (ignore what was
+remembered).
 """
 
 from __future__ import annotations
@@ -19,8 +24,18 @@ import sys
 import time
 from pathlib import Path
 
-MODES: tuple[str, ...] = ("fused", "unfused", "cpu")
+MODES: tuple[str, ...] = ("split", "split_unfused", "fused", "unfused", "cpu")
+_NEXT = {
+    "split": "split_unfused",
+    "split_unfused": "cpu",
+    "fused": "unfused",
+    "unfused": "cpu",
+    "cpu": "cpu",
+}
+DEFAULT = "split"
 RETRY_AFTER_S = 7 * 24 * 3600
+# Bumped when the ladder changes so older remembered steps are ignored.
+KEY_VERSION = "2"
 ENV = "DEMUCS_ONNX_DML"
 
 
@@ -40,7 +55,7 @@ def state_key(ort_version: str, gpu: str | None, model_path: Path) -> str:
         size = model_path.stat().st_size
     except OSError:
         size = 0
-    return f"{ort_version}|{gpu or '?'}|{model_path.name}|{size}"
+    return f"v{KEY_VERSION}|{ort_version}|{gpu or '?'}|{model_path.name}|{size}"
 
 
 def _load(path: Path) -> dict:
@@ -52,7 +67,7 @@ def _load(path: Path) -> dict:
 
 
 def next_mode(mode: str) -> str:
-    return MODES[min(MODES.index(mode) + 1, len(MODES) - 1)]
+    return _NEXT[mode]
 
 
 def start_mode(key: str, *, now: float | None = None, path: Path | None = None) -> tuple[str, str]:
@@ -61,13 +76,13 @@ def start_mode(key: str, *, now: float | None = None, path: Path | None = None) 
     if forced in MODES:
         return forced, "env"
     if forced == "retry":
-        return "fused", "env"
+        return DEFAULT, "env"
     entry = _load(path or state_path()).get(key)
     if isinstance(entry, dict) and entry.get("mode") in MODES:
         age = (now if now is not None else time.time()) - float(entry.get("at", 0))
         if 0 <= age < RETRY_AFTER_S:
             return str(entry["mode"]), "remembered"
-    return "fused", "default"
+    return DEFAULT, "default"
 
 
 def remember(key: str, mode: str, reason: str, *, path: Path | None = None) -> Path | None:
