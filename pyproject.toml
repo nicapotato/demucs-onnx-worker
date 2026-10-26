@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "demucs-onnx-worker"
+version = "0.1.0"
+description = "Desktop Demucs worker: htdemucs_6s via demucs-onnx, with the demucs-ui-app JSON CLI."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { file = "LICENSE" }
+authors = [{ name = "nicapotato" }]
+dependencies = [
+  "demucs-onnx==0.3.4",
+  "lameenc>=1.6",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+  "ruff>=0.5",
+]
+freeze = [
+  "pyinstaller>=6.0",
+]
+
+[project.scripts]
+demucs-onnx-worker = "demucs_onnx_worker.cli:main"
+
+[tool.setuptools.package-dir]
+"" = "src"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]

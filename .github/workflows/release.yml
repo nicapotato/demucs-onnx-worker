@@ -1,0 +1,250 @@
+name: release
+
+# Tags v$VERSION (project.conf) and publishes permanent GitHub Release assets:
+#   demucs-onnx-worker-mac-arm64-vX.Y.Z.zip    CoreML, then CPU
+#   demucs-onnx-worker-mac-x64-vX.Y.Z.zip      Intel Mac, CPU
+#   demucs-onnx-worker-windows-x64-vX.Y.Z.zip  DirectML, then CPU
+#   demucs-onnx-worker-linux-x64-vX.Y.Z.zip    CPU
+#   htdemucs_6s_fp16weights.onnx
+#   SHA256SUMS
+# The same files are also uploaded as a workflow artifact (kept 90 days) so a
+# dry run with publish_gh_release=false still leaves a download. The Release
+# is the permanent pin.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version override (leave empty to use project.conf)"
+        required: false
+        default: ""
+        type: string
+      publish_gh_release:
+        description: "Create git tag + GitHub Release assets"
+        required: false
+        default: true
+        type: boolean
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  PYTHON_VERSION: "3.12"
+  GH_TOKEN: ${{ github.token }}
+
+jobs:
+  read-version:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      tag: ${{ steps.v.outputs.tag }}
+      pin: ${{ steps.v.outputs.pin }}
+      model: ${{ steps.v.outputs.model }}
+    steps:
+      - name: Block re-runs
+        if: github.run_attempt != 1
+        shell: bash
+        run: |
+          echo "::error::Re-runs are disabled (attempt ${{ github.run_attempt }}). Dispatch a new run instead." >&2
+          exit 1
+
+      - uses: actions/checkout@v4
+      - id: v
+        env:
+          INPUT_VERSION: ${{ github.event.inputs.version }}
+        run: |
+          set -euo pipefail
+          if [ -n "${INPUT_VERSION}" ]; then
+            V="${INPUT_VERSION}"
+          else
+            V=$(grep '^VERSION=' project.conf | cut -d= -f2 | tr -d '[:space:]')
+          fi
+          PIN=$(grep '^DEMUCS_ONNX_PIN=' project.conf | cut -d= -f2 | tr -d '[:space:]')
+          MODEL=$(grep '^MODEL_FILE=' project.conf | cut -d= -f2- | tr -d '[:space:]')
+          if [ -z "$V" ] || [ -z "$PIN" ] || [ -z "$MODEL" ]; then
+            echo "ERROR: VERSION, DEMUCS_ONNX_PIN, or MODEL_FILE missing from project.conf" >&2
+            exit 1
+          fi
+          echo "version=${V}" >> "$GITHUB_OUTPUT"
+          echo "tag=v${V}" >> "$GITHUB_OUTPUT"
+          echo "pin=${PIN}" >> "$GITHUB_OUTPUT"
+          echo "model=${MODEL}" >> "$GITHUB_OUTPUT"
+          echo "Version: ${V} (tag v${V}); demucs-onnx ${PIN}; model ${MODEL}"
+
+  test:
+    needs: read-version
+    uses: ./.github/workflows/ci.yml
+
+  fetch-model:
+    needs: [read-version, test]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download the ONNX graph
+        run: bash scripts/fetch_model.sh
+      - name: Stage model asset
+        env:
+          MODEL: ${{ needs.read-version.outputs.model }}
+        run: |
+          set -euo pipefail
+          mkdir -p release-assets
+          cp "models/${MODEL}" "release-assets/${MODEL}"
+          bytes=$(wc -c < "release-assets/${MODEL}" | tr -d ' ')
+          test "$bytes" -gt 100000000
+          test "$bytes" -lt 2147483648
+          echo "model ${MODEL}: ${bytes} bytes"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: onnx-model
+          path: release-assets/*
+          if-no-files-found: error
+          retention-days: 90
+
+  freeze:
+    needs: [read-version, test]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - id: mac-arm64
+            os: macos-latest
+            zip: demucs-onnx-worker-mac-arm64
+          - id: mac-x64
+            os: macos-15-intel
+            zip: demucs-onnx-worker-mac-x64
+          - id: linux-x64
+            os: ubuntu-latest
+            zip: demucs-onnx-worker-linux-x64
+          - id: windows-x64
+            os: windows-latest
+            zip: demucs-onnx-worker-windows-x64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    env:
+      VERSION: ${{ needs.read-version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install
+        run: uv sync --extra dev --extra freeze
+
+      - name: Freeze
+        if: runner.os != 'Windows'
+        run: bash scripts/freeze_worker.sh
+
+      - name: Freeze Windows (DirectML)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: pwsh -File scripts/freeze_worker.ps1
+
+      - name: Package zip
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -x .venv/bin/python ]; then PY=.venv/bin/python; else PY=.venv/Scripts/python.exe; fi
+          mkdir -p release-assets
+          "$PY" scripts/package_release_zip.py \
+            --out "release-assets/${{ matrix.zip }}-v${VERSION}.zip"
+          bytes=$(wc -c < "release-assets/${{ matrix.zip }}-v${VERSION}.zip" | tr -d ' ')
+          test "$bytes" -gt 1000000
+          test "$bytes" -lt 2147483648
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: onnx-worker-${{ matrix.id }}
+          path: release-assets/*
+          if-no-files-found: error
+          retention-days: 90
+
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: [read-version, fetch-model, freeze]
+    env:
+      TAG: ${{ needs.read-version.outputs.tag }}
+      VERSION: ${{ needs.read-version.outputs.version }}
+      PIN: ${{ needs.read-version.outputs.pin }}
+    steps:
+      - name: Block re-runs
+        if: github.run_attempt != 1
+        shell: bash
+        run: |
+          echo "::error::Re-runs are disabled (attempt ${{ github.run_attempt }}). Dispatch a new run instead." >&2
+          exit 1
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Guard duplicate worker tag
+        if: github.event.inputs.publish_gh_release == 'true'
+        run: |
+          set -euo pipefail
+          git fetch --tags origin
+          if git rev-parse "${TAG}" >/dev/null 2>&1; then
+            echo "ERROR: Tag ${TAG} already exists; bump VERSION in project.conf" >&2
+            exit 1
+          fi
+          echo "Tag ${TAG} is available"
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: onnx-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Checksums
+        run: |
+          set -euo pipefail
+          cd release-assets
+          ls -la
+          test -f "demucs-onnx-worker-mac-arm64-v${VERSION}.zip"
+          test -f "demucs-onnx-worker-mac-x64-v${VERSION}.zip"
+          test -f "demucs-onnx-worker-windows-x64-v${VERSION}.zip"
+          test -f "demucs-onnx-worker-linux-x64-v${VERSION}.zip"
+          test -f "${{ needs.read-version.outputs.model }}"
+          sha256sum ./* | tee SHA256SUMS
+
+      - name: Upload release assets artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: demucs-onnx-worker-release
+          path: release-assets/*
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Create worker GitHub Release
+        if: github.event.inputs.publish_gh_release == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.TAG }}
+          target_commitish: ${{ github.sha }}
+          name: demucs-onnx-worker ${{ env.TAG }} (demucs-onnx ${{ env.PIN }})
+          generate_release_notes: true
+          body: |
+            Frozen htdemucs_6s workers for [demucs-ui-app](https://github.com/nicapotato/demucs-ui-app).
+            Library pin: demucs-onnx **${{ env.PIN }}**. One ONNX Runtime wheel per zip; CPU is the fallback inside the Mac ARM and Windows builds.
+
+            ## Assets
+            - `demucs-onnx-worker-mac-arm64-v${{ env.VERSION }}.zip` — Apple Silicon, CoreML then CPU. The Mac app default stays mlx-c.
+            - `demucs-onnx-worker-mac-x64-v${{ env.VERSION }}.zip` — Intel Mac, CPU.
+            - `demucs-onnx-worker-windows-x64-v${{ env.VERSION }}.zip` — DirectML (NVIDIA, AMD, Intel) then CPU. One Windows download.
+            - `demucs-onnx-worker-linux-x64-v${{ env.VERSION }}.zip` — CPU. Linux NVIDIA is a separate freeze (`DEMUCS_ONNX_GPU=1`) and is not in this release.
+            - `${{ needs.read-version.outputs.model }}` — bundled graph. The worker does not download weights.
+            - `SHA256SUMS`
+
+            Each zip's root is the PyInstaller onedir `demucs_onnx_worker/`.
+          files: |
+            release-assets/*

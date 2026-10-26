@@ -1,0 +1,47 @@
+name: ci
+
+# Same gate as `make test`: pytest on Linux, macOS arm64, and Windows.
+# Release calls this before freezing workers.
+
+on:
+  push:
+  pull_request:
+    paths-ignore:
+      - "**/*.md"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version override (unused by ci; accepted for make ci parity)"
+        required: false
+        default: ""
+        type: string
+  workflow_call:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}-${{ github.sha }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  PYTHON_VERSION: "3.12"
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Test
+        run: uv run --extra dev pytest
