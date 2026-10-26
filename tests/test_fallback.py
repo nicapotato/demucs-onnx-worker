@@ -6,14 +6,22 @@ import numpy as np
 import onnxruntime as ort
 import pytest
 
-from demucs_onnx_worker import events, separate
+from demucs_onnx_worker import cli, dml_state, events, separate
 from demucs_onnx_worker.separate import N_CHANNELS, N_SAMPLES, SOURCES
+
+DML = ["DmlExecutionProvider", "CPUExecutionProvider"]
+GPU = "NVIDIA GeForce RTX 3080"
+DML_ERROR = (
+    "Non-zero status code returned while running DmlFusedNode_0_0 node."
+    " Name:'DmlFusedNode_0_0' Status Message: DmlGraphFusionHelper.cpp(1041) 80070057"
+)
 
 
 class FakeSession:
-    def __init__(self, providers: list[str], fail: bool) -> None:
+    def __init__(self, providers: list[str], fail: bool, label: str = "") -> None:
         self._providers = providers
         self._fail = fail
+        self.label = label
         self.calls = 0
 
     def get_providers(self) -> list[str]:
@@ -22,10 +30,7 @@ class FakeSession:
     def run(self, _outputs, feeds):
         self.calls += 1
         if self._fail:
-            raise RuntimeError(
-                "Non-zero status code returned while running DmlFusedNode_0_0 node."
-                ' Name:"DmlFusedNode_0_0"'
-            )
+            raise RuntimeError(DML_ERROR)
         batch = feeds["mix"]
         return [np.zeros((1, len(SOURCES), N_CHANNELS, batch.shape[-1]), dtype=np.float32)]
 
@@ -42,38 +47,110 @@ def fake_audio(monkeypatch):
 
 
 def test_dml_session_options() -> None:
-    opts = separate.session_options(["DmlExecutionProvider", "CPUExecutionProvider"])
+    opts = separate.session_options(DML)
     assert opts.enable_mem_pattern is False
     assert opts.execution_mode == ort.ExecutionMode.ORT_SEQUENTIAL
+    with pytest.raises(RuntimeError):
+        opts.get_session_config_entry(separate.DML_DISABLE_FUSION)
+    unfused = separate.session_options(DML, dml_fusion=False)
+    assert unfused.get_session_config_entry(separate.DML_DISABLE_FUSION) == "1"
     assert separate.session_options(separate.CPU_ONLY).enable_mem_pattern is True
 
 
-def test_gpu_run_failure_retries_on_cpu(tmp_path, fake_audio, capsys) -> None:
-    gpu = FakeSession(["DmlExecutionProvider", "CPUExecutionProvider"], fail=True)
-    cpu = FakeSession(["CPUExecutionProvider"], fail=False)
-    events.set_enabled(True)
-    try:
-        used = separate.separate_file(
-            gpu, tmp_path / "a.wav", tmp_path, "a", mp3=False, bitrate_kbps=128,
-            cpu_fallback=lambda: cpu,
-        )
-    finally:
-        events.set_enabled(False)
+def test_failure_hook_replaces_session(tmp_path, fake_audio) -> None:
+    gpu = FakeSession(DML, fail=True)
+    cpu = FakeSession(separate.CPU_ONLY, fail=False)
+    used = separate.separate_file(
+        gpu, tmp_path / "a.wav", tmp_path, "a", mp3=False, bitrate_kbps=128,
+        on_failure=lambda _s, _e: cpu,
+    )
     assert used is cpu
-    assert cpu.calls > 0
     assert sorted(fake_audio) == sorted(f"{s}.wav" for s in SOURCES)
-    captured = capsys.readouterr()
-    lines = [json.loads(ln) for ln in captured.out.splitlines() if ln]
-    fallback = [ln for ln in lines if ln.get("stage") == "fallback_cpu"]
-    assert fallback and fallback[0]["device"] == "cpu"
-    assert lines[-1]["event"] == "done"
-    assert "DmlFusedNode" in captured.err
 
 
-def test_cpu_run_failure_is_raised(tmp_path, fake_audio) -> None:
-    cpu = FakeSession(["CPUExecutionProvider"], fail=True)
+def test_failure_without_replacement_is_raised(tmp_path, fake_audio) -> None:
+    cpu = FakeSession(separate.CPU_ONLY, fail=True)
     with pytest.raises(RuntimeError, match="DmlFusedNode"):
         separate.separate_file(
             cpu, tmp_path / "a.wav", tmp_path, "a", mp3=False, bitrate_kbps=128,
-            cpu_fallback=lambda: cpu,
+            on_failure=lambda _s, _e: None,
         )
+
+
+@pytest.fixture
+def fake_cli(tmp_path, monkeypatch, fake_audio):
+    """cli._run with fake sessions: fused DML fails, unfused DML fails, CPU works."""
+    model = tmp_path / "htdemucs_6s_fp16weights.onnx"
+    model.write_bytes(b"x" * 10)
+    wav = tmp_path / "song.wav"
+    wav.write_bytes(b"RIFF")
+    monkeypatch.setenv("DEMUCS_ONNX_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.delenv(dml_state.ENV, raising=False)
+    monkeypatch.setattr(cli, "find_model", lambda _d, _w: model)
+    monkeypatch.setattr(cli, "resolve_providers", lambda _p: list(DML))
+    monkeypatch.setattr(cli, "gpu_name", lambda d: GPU if d == "dml" else None)
+    opened: list[str] = []
+
+    def fake_open(_path, providers, *, dml_fusion=True):
+        if providers == separate.CPU_ONLY:
+            opened.append("cpu")
+            return FakeSession(separate.CPU_ONLY, fail=False, label="cpu"), "cpu"
+        label = "fused" if dml_fusion else "unfused"
+        opened.append(label)
+        return FakeSession(DML, fail=True, label=label), "dml"
+
+    monkeypatch.setattr(separate, "open_session", fake_open)
+    argv = [str(wav), "-o", str(tmp_path / "out"), "--track-name", "song", "--progress-json"]
+    return argv, opened
+
+
+def _events(out: str) -> list[dict]:
+    return [json.loads(ln) for ln in out.splitlines() if ln.startswith("{")]
+
+
+def test_dml_ladder_then_remembered(fake_cli, capsys) -> None:
+    argv, opened = fake_cli
+    try:
+        assert cli.main(argv) == 0
+    finally:
+        events.set_enabled(False)
+    assert opened == ["fused", "unfused", "cpu"]
+    captured = capsys.readouterr()
+    stages = [e.get("stage") for e in _events(captured.out) if e["event"] == "status"]
+    assert stages == ["loading_model", "model_ready", "retry_gpu", "fallback_cpu"]
+    fallback = [e for e in _events(captured.out) if e.get("stage") == "fallback_cpu"][0]
+    assert "80070057" in fallback["reason"]
+    assert "DmlFusedNode" in captured.err
+    state = json.loads(dml_state.state_path().read_text(encoding="utf-8"))
+    assert [v["mode"] for v in state.values()] == ["cpu"]
+
+    opened.clear()
+    try:
+        assert cli.main(argv) == 0
+    finally:
+        events.set_enabled(False)
+    assert opened == ["cpu"]
+    remembered = [e for e in _events(capsys.readouterr().out) if e.get("stage") == "fallback_cpu"]
+    assert remembered and "earlier run" in remembered[0]["reason"]
+
+
+def test_retry_env_ignores_remembered(fake_cli, monkeypatch, capsys) -> None:
+    argv, opened = fake_cli
+    key = dml_state.state_key(ort.__version__, GPU, cli.find_model(None, None))
+    dml_state.remember(key, "cpu", "old")
+    monkeypatch.setenv(dml_state.ENV, "retry")
+    try:
+        assert cli.main(argv) == 0
+    finally:
+        events.set_enabled(False)
+    assert opened[0] == "fused"
+
+
+def test_remembered_mode_expires(tmp_path) -> None:
+    path = tmp_path / "s.json"
+    dml_state.remember("k", "unfused", "r", path=path)
+    assert dml_state.start_mode("k", path=path) == ("unfused", "remembered")
+    later = json.loads(path.read_text())["k"]["at"] + dml_state.RETRY_AFTER_S + 1
+    assert dml_state.start_mode("k", path=path, now=later) == ("fused", "default")
+    assert dml_state.next_mode("fused") == "unfused"
+    assert dml_state.next_mode("cpu") == "cpu"

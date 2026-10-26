@@ -19,6 +19,7 @@ from demucs_onnx.inference import N_CHANNELS, N_SAMPLES, SAMPLE_RATE
 
 from .chunking import chunk_count, chunk_span, transition_window
 from .device import device_name
+from .errors import describe
 from .events import emit
 
 SOURCES: tuple[str, ...] = ("drums", "bass", "other", "vocals", "guitar", "piano")
@@ -36,7 +37,10 @@ def sources() -> tuple[str, ...]:
 CPU_ONLY = ["CPUExecutionProvider"]
 
 
-def session_options(providers: list[str]) -> ort.SessionOptions:
+DML_DISABLE_FUSION = "ep.dml.disable_graph_fusion"
+
+
+def session_options(providers: list[str], *, dml_fusion: bool = True) -> ort.SessionOptions:
     opts = ort.SessionOptions()
     opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
     if "DmlExecutionProvider" in providers:
@@ -44,6 +48,10 @@ def session_options(providers: list[str]) -> ort.SessionOptions:
         # Left on, fused DML nodes fail at run time (DmlFusedNode_* non-zero status).
         opts.enable_mem_pattern = False
         opts.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+        if not dml_fusion:
+            # One DML dispatch per ONNX node instead of one fused graph. Slower, but
+            # avoids DmlFusedNode failures and names the failing node if one remains.
+            opts.add_session_config_entry(DML_DISABLE_FUSION, "1")
     return opts
 
 
@@ -51,16 +59,20 @@ def is_cpu_only(session: ort.InferenceSession) -> bool:
     return [p for p in session.get_providers() if p != "CPUExecutionProvider"] == []
 
 
-def open_session(model_path: Path, providers: list[str]) -> tuple[ort.InferenceSession, str]:
+def open_session(
+    model_path: Path, providers: list[str], *, dml_fusion: bool = True
+) -> tuple[ort.InferenceSession, str]:
     """Open the graph. If the GPU provider fails to load, retry on CPU."""
     try:
         session = ort.InferenceSession(
-            str(model_path), sess_options=session_options(providers), providers=list(providers)
+            str(model_path),
+            sess_options=session_options(providers, dml_fusion=dml_fusion),
+            providers=list(providers),
         )
     except Exception as exc:
         if providers == CPU_ONLY:
             raise
-        print(f"demucs_onnx_worker: {providers[0]} failed to load, using CPU: {exc}",
+        print(f"demucs_onnx_worker: {providers[0]} failed to load, using CPU: {describe(exc)}",
               file=sys.stderr)
         session = ort.InferenceSession(
             str(model_path),
@@ -118,12 +130,14 @@ def separate_file(
     mp3: bool,
     bitrate_kbps: int,
     overlap: float = 0.25,
-    cpu_fallback: tp.Callable[[], ort.InferenceSession] | None = None,
+    on_failure: tp.Callable[[ort.InferenceSession, Exception], ort.InferenceSession | None]
+    | None = None,
 ) -> ort.InferenceSession:
     """Separate one track. Returns the session to reuse for the next track.
 
-    When the GPU session raises during ``run`` and ``cpu_fallback`` is given,
-    the track restarts on a CPU session, which is returned.
+    When ``run`` raises, ``on_failure(session, exc)`` may return a replacement
+    session (DML without fusion, then CPU) and the track restarts on it.
+    Returning None re-raises.
     """
     stem_names = sources()
     dest = out_dir / track_name
@@ -138,19 +152,16 @@ def separate_file(
         pct = round(100.0 * done / total, 2) if total else 0.0
         emit("separating", track=str(audio_path), done=done, total=total, pct=pct)
 
-    try:
-        stems = separate_array(session, mix, overlap=overlap, on_chunk=on_chunk)
-    except Exception as exc:
-        if cpu_fallback is None or is_cpu_only(session):
-            raise
-        gpu = device_name(list(session.get_providers()))
-        reason = str(exc).replace("\n", " ")
-        print(f"demucs_onnx_worker: {gpu} inference failed, retrying on CPU: {reason}",
-              file=sys.stderr)
-        session = cpu_fallback()
-        emit("status", stage="fallback_cpu", device="cpu", reason=reason[:300])
-        emit("separating", track=str(audio_path), done=0, total=n_chunks, pct=0.0)
-        stems = separate_array(session, mix, overlap=overlap, on_chunk=on_chunk)
+    while True:
+        try:
+            stems = separate_array(session, mix, overlap=overlap, on_chunk=on_chunk)
+            break
+        except Exception as exc:
+            replacement = on_failure(session, exc) if on_failure is not None else None
+            if replacement is None:
+                raise
+            session = replacement
+            emit("separating", track=str(audio_path), done=0, total=n_chunks, pct=0.0)
     if native_sr != SAMPLE_RATE:
         stems = {
             name: resample_to_native(audio, SAMPLE_RATE, native_sr)

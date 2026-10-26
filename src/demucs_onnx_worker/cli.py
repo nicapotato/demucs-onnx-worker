@@ -10,12 +10,12 @@ from pathlib import Path
 
 from demucs_onnx.providers import resolve_providers
 
-from . import events
-from .device import gpu_name
+from . import dml_state, errors, events
+from .device import device_name, gpu_name
 from .model_path import MODEL_NAME, executable_dir, find_model
 from .separate import separate_file, sources
 
-VERSION = "0.1.1"
+VERSION = "0.1.2"
 
 
 def _batch_size(value: str) -> int | str:
@@ -81,26 +81,75 @@ def _validate(args: argparse.Namespace) -> None:
 
 
 def _one_line(exc: BaseException) -> str:
-    text = str(exc).replace("\n", " ").strip()
-    return text or exc.__class__.__name__
+    return errors.describe(exc)
+
+
+def _log(msg: str) -> None:
+    print(f"demucs_onnx_worker: {msg}", file=sys.stderr)
+    sys.stderr.flush()
 
 
 def _run(args: argparse.Namespace) -> int:
-    from .separate import CPU_ONLY, open_session
+    import onnxruntime as ort
+
+    from .separate import CPU_ONLY, is_cpu_only, open_session
 
     events.emit("status", stage="loading_model", model=MODEL_NAME)
     model_path = find_model(executable_dir(sys.argv[0] if sys.argv else None), args.weights)
     providers = resolve_providers(args.providers)
-    session, device = open_session(model_path, providers)
 
-    def cpu_fallback():
-        return open_session(model_path, CPU_ONLY)[0]
+    uses_dml = "DmlExecutionProvider" in providers
+    gpu = gpu_name("dml") if uses_dml else None
+    key = dml_state.state_key(ort.__version__, gpu, model_path)
+    mode, why = "fused", "default"
+    if uses_dml:
+        mode, why = dml_state.start_mode(key)
+        if why != "default":
+            _log(f"DirectML mode {mode} ({why}; {dml_state.state_path()}, "
+                 f"set {dml_state.ENV}=retry to try the GPU again)")
+        if mode == "cpu":
+            providers = CPU_ONLY
+    session, device = open_session(model_path, providers, dml_fusion=mode != "unfused")
+    if uses_dml and is_cpu_only(session) and mode != "cpu":
+        mode = "cpu"
+    state = {"mode": mode}
+
+    def on_failure(failed: ort.InferenceSession, exc: Exception):
+        if is_cpu_only(failed):
+            return None
+        reason = _one_line(exc)
+        was = device_name(list(failed.get_providers()))
+        nxt = dml_state.next_mode(state["mode"]) if uses_dml else "cpu"
+        _log(f"{was} ({state['mode']}) inference failed: {reason}")
+        if nxt == "unfused":
+            _log("retrying DirectML with graph fusion disabled")
+            replacement, dev = open_session(model_path, providers, dml_fusion=False)
+            nxt = "unfused" if not is_cpu_only(replacement) else "cpu"
+            events.emit("status", stage="retry_gpu" if nxt == "unfused" else "fallback_cpu",
+                        device=dev, mode=nxt, reason=reason[:1000])
+        else:
+            _log("retrying on CPU")
+            replacement = open_session(model_path, CPU_ONLY)[0]
+            events.emit("status", stage="fallback_cpu", device="cpu", mode="cpu",
+                        reason=reason[:1000])
+        state["mode"] = nxt
+        if uses_dml:
+            saved = dml_state.remember(key, nxt, reason)
+            if saved:
+                _log(f"next runs start in DirectML mode {nxt} ({saved})")
+        return replacement
 
     ready = {"model": MODEL_NAME, "device": device, "sources": list(sources())}
+    if uses_dml:
+        ready["mode"] = mode
     gpu = gpu_name(device)
     if gpu:
         ready["gpu"] = gpu
     events.emit("status", stage="model_ready", **ready)
+    if uses_dml and mode == "cpu" and why == "remembered":
+        events.emit("status", stage="fallback_cpu", device="cpu", mode="cpu",
+                    reason="DirectML failed on an earlier run on this GPU; using CPU. "
+                    f"Set {dml_state.ENV}=retry to try the GPU again.")
     for track in args.tracks:
         path = Path(track)
         if not path.is_file():
@@ -114,7 +163,7 @@ def _run(args: argparse.Namespace) -> int:
             mp3=args.mp3,
             bitrate_kbps=args.mp3_bitrate,
             overlap=args.overlap,
-            cpu_fallback=cpu_fallback,
+            on_failure=on_failure,
         )
     return 0
 
@@ -143,7 +192,8 @@ def main(argv: list[str] | None = None) -> int:
     except Exception as exc:
         events.emit("error", message=_one_line(exc))
         # stdout carries one-line JSON for the GUI; the full traceback goes to stderr.
-        traceback.print_exc(file=sys.stderr)
+        for ln in errors.printable_lines(traceback.format_exc()):
+            print(ln, file=sys.stderr)
         sys.stderr.flush()
         return 1
 
