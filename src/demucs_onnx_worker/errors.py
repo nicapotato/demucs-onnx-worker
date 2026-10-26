@@ -54,9 +54,28 @@ def hresult(text: str) -> tuple[str, str] | None:
     return (failures[-1], "") if failures else None
 
 
+CPU_HINT = "Switch the stems device to CPU in the app and run again."
+
+
+class GpuFailed(RuntimeError):
+    """``--device gpu`` could not run on the GPU. The message already leads with
+    the advice and carries the described cause."""
+
+
+def gpu_failed_message(providers: list[str], stage: str, cause: BaseException,
+                       gpu: str | None = None) -> str:
+    where = providers[0].replace("ExecutionProvider", "")
+    where = {"Dml": "DirectML"}.get(where, where)
+    if gpu:
+        where += f" on {gpu}"
+    return f"GPU {stage} failed ({where}). {CPU_HINT} Cause: {describe(cause)}"
+
+
 def describe(exc: BaseException) -> str:
     """One printable line, HRESULT first so a truncating GUI still shows it."""
     text = one_line(str(exc)) or exc.__class__.__name__
+    if isinstance(exc, GpuFailed):
+        return text
     hr = hresult(text)
     if hr is None:
         return text

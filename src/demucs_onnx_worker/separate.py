@@ -19,7 +19,7 @@ from demucs_onnx.inference import N_CHANNELS, N_SAMPLES, SAMPLE_RATE
 
 from .chunking import chunk_count, chunk_span, transition_window
 from .device import device_name
-from .errors import describe
+from .errors import CPU_HINT, GpuFailed, describe, gpu_failed_message
 from .events import emit
 
 SOURCES: tuple[str, ...] = ("drums", "bass", "other", "vocals", "guitar", "piano")
@@ -60,9 +60,12 @@ def is_cpu_only(session: ort.InferenceSession) -> bool:
 
 
 def open_session(
-    model_path: Path, providers: list[str], *, dml_fusion: bool = True
+    model_path: Path, providers: list[str], *, dml_fusion: bool = True, strict: bool = False
 ) -> tuple[ort.InferenceSession, str]:
-    """Open the graph. If the GPU provider fails to load, retry on CPU."""
+    """Open the graph. If the GPU provider fails to load, retry on CPU.
+
+    ``strict`` (``--device gpu``) raises :class:`GpuFailed` instead of retrying.
+    """
     try:
         session = ort.InferenceSession(
             str(model_path),
@@ -72,6 +75,8 @@ def open_session(
     except Exception as exc:
         if providers == CPU_ONLY:
             raise
+        if strict:
+            raise GpuFailed(gpu_failed_message(providers, "load", exc)) from exc
         print(f"demucs_onnx_worker: {providers[0]} failed to load, using CPU: {describe(exc)}",
               file=sys.stderr)
         session = ort.InferenceSession(
@@ -79,16 +84,21 @@ def open_session(
             sess_options=session_options(CPU_ONLY),
             providers=CPU_ONLY,
         )
+    if strict and providers != CPU_ONLY and is_cpu_only(session):
+        raise GpuFailed(
+            f"{providers[0]} was not enabled for this session (only CPU loaded). {CPU_HINT}"
+        )
     return session, device_name(list(session.get_providers()))
 
 
 def open_mode(
-    model_path: Path, providers: list[str], mode: str, cache_dir: Path
+    model_path: Path, providers: list[str], mode: str, cache_dir: Path, *, strict: bool = False
 ) -> tuple[tp.Any, str, str]:
     """Open the session for a DirectML ladder mode (see dml_state).
 
     Returns ``(session, device, mode)``; ``mode`` changes when a split cannot be
     built (no ``onnx`` package, unexpected graph) or the GPU fails to load.
+    With ``strict`` a GPU that fails to load raises :class:`GpuFailed`.
     """
     if mode == "cpu" or providers == CPU_ONLY:
         return (*open_session(model_path, CPU_ONLY), "cpu")
@@ -103,12 +113,12 @@ def open_mode(
                   "running it whole on the GPU", file=sys.stderr)
             mode = "fused" if fusion else "unfused"
         else:
-            head, device = open_session(head_path, providers, dml_fusion=fusion)
+            head, device = open_session(head_path, providers, dml_fusion=fusion, strict=strict)
             if is_cpu_only(head):
                 return (*open_session(model_path, CPU_ONLY), "cpu")
             tail, _ = open_session(tail_path, CPU_ONLY)
             return SplitSession(head, tail), device, mode
-    session, device = open_session(model_path, providers, dml_fusion=fusion)
+    session, device = open_session(model_path, providers, dml_fusion=fusion, strict=strict)
     return session, device, ("cpu" if is_cpu_only(session) else mode)
 
 

@@ -25,6 +25,12 @@ The execution provider is whichever ONNX Runtime wheel was frozen into that buil
 
 Linux AMD and Intel GPUs stay on the CPU build. CoreML's first session compiles the graph before the first song.
 
+`--device` picks how strict that is:
+
+- `auto` (the default) uses the GPU and falls back to CPU when it fails to load or to run. A DirectML failure is remembered per GPU for 7 days, so later songs go straight to CPU.
+- `gpu` never falls back. A GPU failure exits 1 with an `error` event that has `"kind": "gpu_failed"`. Its message starts with the advice to switch to CPU. demucs-ui-app and Rock N Roller pass this unless the user picked CPU.
+- `cpu` skips the GPU.
+
 The frozen runtime (Python, numpy, ONNX Runtime, audio libraries) is on the order of 100–160 MB for the CoreML, DirectML, and CPU builds. The CUDA Linux wheel alone is about 235 MB. The model file is separate: `htdemucs_6s_fp16weights.onnx` is about 136 MB and still computes in fp32.
 
 ## Dev

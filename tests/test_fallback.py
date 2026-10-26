@@ -94,7 +94,7 @@ def fake_cli(tmp_path, monkeypatch, fake_audio):
     monkeypatch.setattr(cli, "gpu_name", lambda d: GPU if d == "dml" else None)
     opened: list[str] = []
 
-    def fake_open(path, providers, *, dml_fusion=True):
+    def fake_open(path, providers, *, dml_fusion=True, strict=False):
         prefix = "split_" if path.name.startswith(("head", "tail")) else ""
         if providers == separate.CPU_ONLY:
             opened.append(prefix + "cpu")
@@ -153,6 +153,59 @@ def test_retry_env_ignores_remembered(fake_cli, monkeypatch, capsys) -> None:
     finally:
         events.set_enabled(False)
     assert opened[0] == "split_fused"
+
+
+def test_device_gpu_errors_instead_of_cpu(fake_cli, capsys) -> None:
+    argv, opened = fake_cli
+    try:
+        assert cli.main([*argv, "--device", "gpu"]) == 1
+    finally:
+        events.set_enabled(False)
+    assert opened == ["split_fused", "split_cpu", "split_unfused", "split_cpu"]
+    evs = _events(capsys.readouterr().out)
+    assert "fallback_cpu" not in [e.get("stage") for e in evs]
+    err = [e for e in evs if e["event"] == "error"][0]
+    assert err["kind"] == "gpu_failed"
+    assert err["message"].startswith(f"GPU inference failed (DirectML on {GPU}). Switch")
+    assert "80070057" in err["message"]
+    state = json.loads(dml_state.state_path().read_text(encoding="utf-8"))
+    assert [v["mode"] for v in state.values()] == ["split_unfused"]
+
+
+def test_device_gpu_ignores_remembered_cpu(fake_cli, capsys) -> None:
+    argv, opened = fake_cli
+    key = dml_state.state_key(ort.__version__, GPU, cli.find_model(None, None))
+    dml_state.remember(key, "cpu", "old")
+    try:
+        assert cli.main([*argv, "--device", "gpu"]) == 1
+    finally:
+        events.set_enabled(False)
+    assert opened[0] == "split_fused"
+    assert "cpu" not in opened
+
+
+def test_device_gpu_without_gpu_provider(fake_cli, monkeypatch, capsys) -> None:
+    argv, opened = fake_cli
+    monkeypatch.setattr(cli, "resolve_providers", lambda _p: list(separate.CPU_ONLY))
+    try:
+        assert cli.main([*argv, "--device", "gpu"]) == 1
+    finally:
+        events.set_enabled(False)
+    assert opened == []
+    err = [e for e in _events(capsys.readouterr().out) if e["event"] == "error"][0]
+    assert err["kind"] == "gpu_failed" and "No GPU" in err["message"]
+
+
+def test_device_cpu_skips_gpu(fake_cli, capsys) -> None:
+    argv, opened = fake_cli
+    try:
+        assert cli.main([*argv, "--device", "cpu"]) == 0
+    finally:
+        events.set_enabled(False)
+    assert opened == ["cpu"]
+    assert not dml_state.state_path().exists()
+    ready = [e for e in _events(capsys.readouterr().out) if e.get("stage") == "model_ready"][0]
+    assert ready["device"] == "cpu"
 
 
 def test_env_forces_whole_graph_mode(fake_cli, monkeypatch) -> None:

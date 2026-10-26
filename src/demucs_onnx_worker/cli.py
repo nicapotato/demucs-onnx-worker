@@ -12,10 +12,11 @@ from demucs_onnx.providers import resolve_providers
 
 from . import dml_state, errors, events
 from .device import device_name, gpu_name
+from .errors import CPU_HINT, GpuFailed, gpu_failed_message
 from .model_path import MODEL_NAME, executable_dir, find_model
 from .separate import separate_file, sources
 
-VERSION = "0.1.2"
+VERSION = "0.1.4"
 
 
 def _batch_size(value: str) -> int | str:
@@ -45,6 +46,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--providers",
         default="auto",
         help="auto, cpu, coreml, cuda, or dml. Default: auto for this build's ORT wheel",
+    )
+    parser.add_argument(
+        "--device",
+        choices=["auto", "gpu", "cpu"],
+        default="auto",
+        help="auto: GPU, falling back to CPU when it fails (remembered per GPU). "
+        "gpu: GPU only; a GPU failure is an error. cpu: CPU only.",
     )
     parser.add_argument("--segment", type=float, default=None, help="Accepted and ignored")
     parser.add_argument("--overlap", type=float, default=0.25, help="Overlap ratio")
@@ -96,7 +104,13 @@ def _run(args: argparse.Namespace) -> int:
 
     events.emit("status", stage="loading_model", model=MODEL_NAME)
     model_path = find_model(executable_dir(sys.argv[0] if sys.argv else None), args.weights)
-    providers = resolve_providers(args.providers)
+    providers = CPU_ONLY if args.device == "cpu" else resolve_providers(args.providers)
+    strict = args.device == "gpu"
+    if strict and providers == CPU_ONLY:
+        raise GpuFailed(
+            f"No GPU is available to this worker (onnxruntime {ort.__version__} offers "
+            f"{', '.join(ort.get_available_providers())}). {CPU_HINT}"
+        )
 
     uses_dml = "DmlExecutionProvider" in providers
     gpu = gpu_name("dml") if uses_dml else None
@@ -105,12 +119,15 @@ def _run(args: argparse.Namespace) -> int:
     mode, why = dml_state.DEFAULT, "default"
     if uses_dml:
         mode, why = dml_state.start_mode(key)
+        if strict and mode == "cpu":
+            _log(f"ignoring DirectML mode cpu ({why}): --device gpu")
+            mode, why = dml_state.DEFAULT, "default"
         if why != "default":
             _log(f"DirectML mode {mode} ({why}; {dml_state.state_path()}, "
                  f"set {dml_state.ENV}=retry to try the GPU again)")
-        session, device, mode = open_mode(model_path, providers, mode, cache_dir)
+        session, device, mode = open_mode(model_path, providers, mode, cache_dir, strict=strict)
     else:
-        session, device = open_session(model_path, providers)
+        session, device = open_session(model_path, providers, strict=strict)
     state = {"mode": mode}
 
     def on_failure(failed: ort.InferenceSession, exc: Exception):
@@ -120,9 +137,13 @@ def _run(args: argparse.Namespace) -> int:
         was = device_name(list(failed.get_providers()))
         nxt = dml_state.next_mode(state["mode"]) if uses_dml else "cpu"
         _log(f"{was} ({state['mode']}) inference failed: {reason}")
+        if strict and nxt == "cpu":
+            raise GpuFailed(gpu_failed_message(providers, "inference", exc, gpu)) from exc
         if nxt != "cpu":
             _log(f"retrying DirectML in mode {nxt} (graph fusion disabled)")
-            replacement, dev, nxt = open_mode(model_path, providers, nxt, cache_dir)
+            replacement, dev, nxt = open_mode(
+                model_path, providers, nxt, cache_dir, strict=strict
+            )
             events.emit("status", stage="retry_gpu" if nxt != "cpu" else "fallback_cpu",
                         device=dev, mode=nxt, reason=reason[:1000])
         else:
@@ -188,7 +209,10 @@ def main(argv: list[str] | None = None) -> int:
     try:
         return _run(args)
     except Exception as exc:
-        events.emit("error", message=_one_line(exc))
+        if isinstance(exc, GpuFailed):
+            events.emit("error", message=_one_line(exc), kind="gpu_failed")
+        else:
+            events.emit("error", message=_one_line(exc))
         # stdout carries one-line JSON for the GUI; the full traceback goes to stderr.
         for ln in errors.printable_lines(traceback.format_exc()):
             print(ln, file=sys.stderr)
