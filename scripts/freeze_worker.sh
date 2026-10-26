@@ -18,13 +18,29 @@ if [[ ! -x "$PY" ]]; then
   exit 1
 fi
 
+py_install() {
+  if command -v uv >/dev/null 2>&1; then
+    uv pip install --python "$PY" "$@"
+  else
+    "$PY" -m pip install "$@"
+  fi
+}
+
+py_uninstall() {
+  if command -v uv >/dev/null 2>&1; then
+    uv pip uninstall --python "$PY" "$@" || true
+  else
+    "$PY" -m pip uninstall -y "$@" >/dev/null 2>&1 || true
+  fi
+}
+
 if [[ "${DEMUCS_ONNX_GPU:-}" == "1" ]]; then
   echo "installing onnxruntime-gpu into this venv (replaces the CPU wheel)"
-  "$PY" -m pip uninstall -y onnxruntime onnxruntime-gpu onnxruntime-directml >/dev/null 2>&1 || true
-  "$PY" -m pip install "onnxruntime-gpu>=1.17"
+  py_uninstall onnxruntime onnxruntime-gpu onnxruntime-directml
+  py_install "onnxruntime-gpu>=1.17"
 fi
 
-"$PY" -c "import PyInstaller" 2>/dev/null || "$PY" -m pip install "pyinstaller>=6"
+"$PY" -c "import PyInstaller" 2>/dev/null || py_install "pyinstaller>=6"
 "$PY" -c "import onnxruntime, demucs_onnx, lameenc, soundfile, soxr; print('onnxruntime', onnxruntime.__version__, onnxruntime.get_available_providers())"
 
 rm -rf "$DIST/demucs_onnx_worker" "$WORK"

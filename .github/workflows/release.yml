@@ -138,7 +138,23 @@ jobs:
           python-version: ${{ env.PYTHON_VERSION }}
 
       - name: Install
+        if: matrix.id != 'mac-x64'
         run: uv sync --extra dev --extra freeze
+
+      # onnxruntime 1.24+ publishes no macOS x86_64 wheel, so `uv sync` cannot
+      # install the locked 1.31.0 there. 1.23.2 is the last release that can.
+      - name: Install Intel Mac
+        if: matrix.id == 'mac-x64'
+        run: |
+          set -euo pipefail
+          PIN=$(grep '^ORT_MAC_X64_PIN=' project.conf | cut -d= -f2 | tr -d '[:space:]')
+          test -n "$PIN"
+          uv venv --python 3.12 .venv
+          printf 'onnxruntime==%s\n' "$PIN" > "${RUNNER_TEMP}/ort-constraint.txt"
+          uv pip install --python .venv/bin/python \
+            --constraint "${RUNNER_TEMP}/ort-constraint.txt" \
+            -e ".[dev,freeze]"
+          .venv/bin/python -c "import onnxruntime; print('onnxruntime', onnxruntime.__version__)"
 
       - name: Freeze
         if: runner.os != 'Windows'
@@ -239,7 +255,7 @@ jobs:
 
             ## Assets
             - `demucs-onnx-worker-mac-arm64-v${{ env.VERSION }}.zip` — Apple Silicon, CoreML then CPU. The Mac app default stays mlx-c.
-            - `demucs-onnx-worker-mac-x64-v${{ env.VERSION }}.zip` — Intel Mac, CPU.
+            - `demucs-onnx-worker-mac-x64-v${{ env.VERSION }}.zip` — Intel Mac, CPU, onnxruntime 1.23.2 (last macOS x86_64 wheel).
             - `demucs-onnx-worker-windows-x64-v${{ env.VERSION }}.zip` — DirectML (NVIDIA, AMD, Intel) then CPU. One Windows download.
             - `demucs-onnx-worker-linux-x64-v${{ env.VERSION }}.zip` — CPU. Linux NVIDIA is a separate freeze (`DEMUCS_ONNX_GPU=1`) and is not in this release.
             - `${{ needs.read-version.outputs.model }}` — bundled graph. The worker does not download weights.

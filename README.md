@@ -67,7 +67,7 @@ That runs the test gate, freezes four workers, and tags `v$VERSION`. The GitHub 
 | Asset | Runner | Provider |
 |---|---|---|
 | `demucs-onnx-worker-mac-arm64-v*.zip` | `macos-latest` | CoreML, then CPU |
-| `demucs-onnx-worker-mac-x64-v*.zip` | `macos-15-intel` | CPU |
+| `demucs-onnx-worker-mac-x64-v*.zip` | `macos-15-intel` | CPU, onnxruntime 1.23.2 |
 | `demucs-onnx-worker-windows-x64-v*.zip` | `windows-latest` | DirectML, then CPU |
 | `demucs-onnx-worker-linux-x64-v*.zip` | `ubuntu-latest` | CPU |
 | `htdemucs_6s_fp16weights.onnx` | fetched once | shared graph |

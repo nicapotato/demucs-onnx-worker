@@ -2,6 +2,8 @@
 # The default `onnxruntime` wheel is CPU-only. This script replaces it in the
 # venv with onnxruntime-directml before PyInstaller collects the DLLs.
 $ErrorActionPreference = "Stop"
+# A uv venv has no pip. Native-command failures must not abort before we check them.
+$PSNativeCommandUseErrorActionPreference = $false
 
 $Root = Split-Path -Parent $PSScriptRoot
 Set-Location $Root
@@ -23,13 +25,17 @@ if (-not (Test-Path $Python)) {
 }
 
 Write-Host "switching this venv to onnxruntime-directml (CPU wheel cannot see DirectML)"
-& $Python -m pip uninstall -y onnxruntime onnxruntime-gpu onnxruntime-directml
-& $Python -m pip install "onnxruntime-directml==1.24.4"
+if (-not (Get-Command uv -ErrorAction SilentlyContinue)) {
+    Write-Error "uv is required (the project venv does not include pip)"
+}
+& uv pip uninstall --python $Python onnxruntime
+& uv pip install --python $Python "onnxruntime-directml==1.24.4"
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 & $Python -c "import PyInstaller" 2>$null
 if ($LASTEXITCODE -ne 0) {
-    & $Python -m pip install "pyinstaller>=6"
+    & uv pip install --python $Python "pyinstaller>=6"
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 }
 
 & $Python -c "import onnxruntime, demucs_onnx, lameenc, soundfile, soxr; print('onnxruntime', onnxruntime.__version__, onnxruntime.get_available_providers())"
