@@ -122,6 +122,30 @@ def open_mode(
     return session, device, ("cpu" if is_cpu_only(session) else mode)
 
 
+class BadGpuOutput(RuntimeError):
+    """The GPU ran without an error but returned stems that are not audio."""
+
+
+# The six stems sum back to roughly the mix (residual well under the mix level).
+# A residual louder than the mix, or than this floor on near-silent chunks, is garbage.
+RESIDUAL_FLOOR_RMS = 0.01
+
+
+def check_stems(stems: np.ndarray, chunk: np.ndarray, index: int) -> None:
+    """Raise :class:`BadGpuOutput` when ``stems`` ``(sources, 2, n)`` cannot be a
+    separation of ``chunk`` ``(2, n)``: NaN/Inf, or stems that do not add up to it."""
+    if not np.isfinite(stems).all():
+        raise BadGpuOutput(f"GPU returned NaN/Inf stems (chunk {index + 1})")
+    mix_rms = float(np.sqrt(np.mean(np.square(chunk, dtype=np.float64))))
+    residual = stems.sum(axis=0, dtype=np.float64) - chunk
+    residual_rms = float(np.sqrt(np.mean(np.square(residual))))
+    if residual_rms > max(mix_rms, RESIDUAL_FLOOR_RMS):
+        raise BadGpuOutput(
+            f"GPU returned stems that do not add up to the mix (chunk {index + 1}: "
+            f"residual RMS {residual_rms:.4g}, mix RMS {mix_rms:.4g})"
+        )
+
+
 def separate_array(
     session: ort.InferenceSession,
     mix: np.ndarray,
@@ -129,7 +153,10 @@ def separate_array(
     overlap: float = 0.25,
     on_chunk=None,
 ) -> dict[str, np.ndarray]:
-    """Run overlap-add. ``mix`` is float32 ``(2, samples)`` at 44.1 kHz."""
+    """Run overlap-add. ``mix`` is float32 ``(2, samples)`` at 44.1 kHz.
+
+    GPU sessions get every chunk checked (:func:`check_stems`): some drivers / older
+    cards run the graph "successfully" and return noise or a constant tone."""
     if mix.ndim != 2 or mix.shape[0] != N_CHANNELS:
         raise ValueError(f"expected (channels=2, samples), got {mix.shape}")
 
@@ -139,6 +166,7 @@ def separate_array(
     window = transition_window(N_SAMPLES, overlap)
     out = {name: np.zeros((N_CHANNELS, total_len), dtype=np.float32) for name in stem_names}
     weight = np.zeros(total_len, dtype=np.float32)
+    verify = not is_cpu_only(session)
 
     for index in range(n_chunks):
         start, end = chunk_span(index, total_len, N_SAMPLES, overlap)
@@ -149,6 +177,8 @@ def separate_array(
         chunk_len = end - start
         fade = window[:chunk_len]
         stems = session.run(["stems"], {"mix": tensor})[0][0]
+        if verify:
+            check_stems(stems[:, :, :chunk_len], mix[:, start:end], index)
         for row, name in enumerate(stem_names):
             out[name][:, start:end] += stems[row, :, :chunk_len] * fade
         weight[start:end] += fade

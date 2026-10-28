@@ -71,6 +71,64 @@ def test_failure_hook_replaces_session(tmp_path, fake_audio) -> None:
     assert sorted(fake_audio) == sorted(f"{s}.wav" for s in SOURCES)
 
 
+class BeepSession(FakeSession):
+    """Runs without error but returns a full-scale sine in every stem."""
+
+    def run(self, _outputs, feeds):
+        self.calls += 1
+        n = feeds["mix"].shape[-1]
+        tone = 0.9 * np.sin(2 * np.pi * 1000 * np.arange(n) / 44100).astype(np.float32)
+        return [np.broadcast_to(tone, (1, len(SOURCES), N_CHANNELS, n)).copy()]
+
+
+def test_check_stems_accepts_a_separation() -> None:
+    rng = np.random.default_rng(0)
+    parts = rng.normal(0, 0.1, (len(SOURCES), N_CHANNELS, 4096)).astype(np.float32)
+    mix = parts.sum(axis=0)
+    noisy = parts + rng.normal(0, 0.02, parts.shape).astype(np.float32)
+    separate.check_stems(noisy, mix, 0)
+    separate.check_stems(np.zeros_like(parts), np.zeros_like(mix), 0)
+
+
+def test_check_stems_rejects_garbage() -> None:
+    mix = np.full((N_CHANNELS, 4096), 0.1, dtype=np.float32)
+    bad = np.zeros((len(SOURCES), N_CHANNELS, 4096), dtype=np.float32)
+    bad[0, 0, 7] = np.nan
+    with pytest.raises(separate.BadGpuOutput, match="NaN"):
+        separate.check_stems(bad, mix, 0)
+    beep = np.full((len(SOURCES), N_CHANNELS, 4096), 0.9, dtype=np.float32)
+    with pytest.raises(separate.BadGpuOutput, match="do not add up"):
+        separate.check_stems(beep, mix, 2)
+    with pytest.raises(separate.BadGpuOutput):
+        separate.check_stems(beep, np.zeros_like(mix), 0)
+
+
+def test_gpu_beep_falls_back(tmp_path, fake_audio) -> None:
+    gpu = BeepSession(DML, fail=False)
+    cpu = FakeSession(separate.CPU_ONLY, fail=False)
+    seen: list[Exception] = []
+
+    def on_failure(_s, exc):
+        seen.append(exc)
+        return cpu
+
+    used = separate.separate_file(
+        gpu, tmp_path / "a.wav", tmp_path, "a", mp3=False, bitrate_kbps=128,
+        on_failure=on_failure,
+    )
+    assert used is cpu and gpu.calls == 1
+    assert isinstance(seen[0], separate.BadGpuOutput)
+
+
+def test_cpu_output_is_not_checked(tmp_path, fake_audio) -> None:
+    cpu = BeepSession(separate.CPU_ONLY, fail=False)
+    separate.separate_file(
+        cpu, tmp_path / "a.wav", tmp_path, "a", mp3=False, bitrate_kbps=128,
+        on_failure=lambda _s, _e: None,
+    )
+    assert len(fake_audio) == len(SOURCES)
+
+
 def test_failure_without_replacement_is_raised(tmp_path, fake_audio) -> None:
     cpu = FakeSession(separate.CPU_ONLY, fail=True)
     with pytest.raises(RuntimeError, match="DmlFusedNode"):
